@@ -1,0 +1,348 @@
+import cv2
+import numpy as np
+import pygame
+import math
+import heapq
+import time
+
+# =========================
+# A* PATH PLANNER (4-neigh)
+# =========================
+def astar(grid, start, goal):
+    rows, cols = len(grid), len(grid[0])
+    if not (0 <= start[0] < rows and 0 <= start[1] < cols and
+            0 <= goal[0]  < rows and 0 <= goal[1]  < cols):
+        return []
+
+    if grid[start[0]][start[1]] == 1 or grid[goal[0]][goal[1]] == 1:
+        return []
+
+    def h(a, b):
+        return abs(a[0]-b[0]) + abs(a[1]-b[1])  # Manhattan
+
+    open_heap = []
+    heapq.heappush(open_heap, (0 + h(start, goal), 0, start))
+    came_from = {start: None}
+    g = {start: 0}
+
+    while open_heap:
+        _, _, cur = heapq.heappop(open_heap)
+        if cur == goal:
+            # reconstruct (without start)
+            out = []
+            while came_from[cur] is not None:
+                out.append(cur)
+                cur = came_from[cur]
+            out.reverse()
+            return out
+
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            nx, ny = cur[0]+dx, cur[1]+dy
+            if 0 <= nx < rows and 0 <= ny < cols and grid[nx][ny] == 0:
+                ng = g[cur] + 1
+                if (nx, ny) not in g or ng < g[(nx,ny)]:
+                    g[(nx,ny)] = ng
+                    came_from[(nx,ny)] = cur
+                    heapq.heappush(open_heap, (ng + h((nx,ny), goal), ng, (nx,ny)))
+    return []
+
+
+# =========================
+# CONFIG
+# =========================
+GRID_W, GRID_H = 40, 30         # columns, rows (more = finer map)
+CELL = 20                       # pixels per grid cell (Pygame)
+WIN_W, WIN_H = GRID_W*CELL, GRID_H*CELL
+
+ROBOT_START = (GRID_H-1, 1)     # (row, col)
+GOAL_START  = (1, GRID_W-2)
+
+# Motion
+PIXELS_PER_SEC = 140            # robot speed
+REPLAN_EVERY_SEC = 0.15         # replan cadence, plus event-driven triggers
+
+# Detection
+MIN_CONTOUR_AREA = 900          # ignore tiny noise in pixels
+KERNEL = np.ones((5,5), np.uint8)
+
+# Initial scan time (seconds)
+SCAN_SEC = 2.0
+
+# Workspace in meters for coordinate output (X: left->right, Y: top->bottom)
+WORLD_X_MIN, WORLD_X_MAX = -0.5, 0.5
+WORLD_Y_MIN, WORLD_Y_MAX = -0.5, 0.5
+
+
+# =========================
+# UTILS
+# =========================
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def rc_to_center_px(r, c):
+    return int(c*CELL + CELL/2), int(r*CELL + CELL/2)
+
+def px_to_grid(x_px, y_px, frame_w, frame_h):
+    # map camera-pixel → grid cell
+    gcol = int(x_px / frame_w * GRID_W)
+    grow = int(y_px / frame_h * GRID_H)
+    return clamp(grow, 0, GRID_H-1), clamp(gcol, 0, GRID_W-1)
+
+def bbox_to_grid(x, y, w, h, frame_w, frame_h):
+    c0 = int(x / frame_w * GRID_W)
+    r0 = int(y / frame_h * GRID_H)
+    c1 = int((x+w) / frame_w * GRID_W)
+    r1 = int((y+h) / frame_h * GRID_H)
+    c0, r0 = clamp(c0,0,GRID_W-1), clamp(r0,0,GRID_H-1)
+    c1, r1 = clamp(c1,0,GRID_W-1), clamp(r1,0,GRID_H-1)
+    if c1 < c0: c0, c1 = c1, c0
+    if r1 < r0: r0, r1 = r1, r0
+    return r0, c0, r1, c1
+
+def grid_cell_to_world(rc):
+    """Convert grid cell (row, col) to world coordinates (x, y) in meters."""
+    r, c = rc
+    x = WORLD_X_MIN + (c + 0.5) / GRID_W * (WORLD_X_MAX - WORLD_X_MIN)
+    y = WORLD_Y_MIN + (r + 0.5) / GRID_H * (WORLD_Y_MAX - WORLD_Y_MIN)
+    return (x, y)
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    # ---- Pygame
+    pygame.init()
+    screen = pygame.display.set_mode((WIN_W, WIN_H))
+    pygame.display.set_caption("A* Path Planning – Live Obstacle Detection")
+    font = pygame.font.SysFont("consolas", 16)
+    clock = pygame.time.Clock()
+
+    # ---- Camera (with safe fallback)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    has_cam, frame = cap.read() if cap is not None else (False, None)
+    if not has_cam:
+        print("⚠️  Webcam not found. Running in demo mode (synthetic obstacles).")
+        if cap is not None:
+            cap.release()
+        cap = None
+        frame_h, frame_w = 480, 640
+    else:
+        frame_h, frame_w = frame.shape[:2]
+
+    # ---- Initial scan to cover whole workspace
+    initial_grid = [[0]*GRID_W for _ in range(GRID_H)]
+    if cap is not None:
+        t0 = time.time()
+        print(f"Scanning workspace for {SCAN_SEC:.1f}s to build initial obstacle map...")
+        while time.time() - t0 < SCAN_SEC:
+            ok, f = cap.read()
+            if not ok:
+                break
+            f = cv2.flip(f, 1)
+            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (7,7), 0)
+            bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 35, 8)
+            bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, KERNEL, iterations=1)
+            bw = cv2.dilate(bw, KERNEL, iterations=1)
+            contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < MIN_CONTOUR_AREA:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                r0, c0, r1, c1 = bbox_to_grid(x, y, w, h, frame_w, frame_h)
+                for r in range(r0, r1+1):
+                    for c in range(c0, c1+1):
+                        initial_grid[r][c] = 1
+            # small wait
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        print("Initial scan complete.")
+    else:
+        # Demo mode: seed a static obstacle pattern for initial grid
+        for r in range(6, GRID_H-6):
+            c = GRID_W//3
+            initial_grid[r][c] = 1
+            initial_grid[r][c+1] = 1
+
+    # ---- State
+    robot_rc = list(ROBOT_START)                # grid row, col (int)
+    robot_px = list(rc_to_center_px(*robot_rc)) # pixel center (float ok)
+    goal_rc  = list(GOAL_START)
+
+    # Start with the initial grid as baseline; it will be updated dynamically
+    baseline_grid = initial_grid
+    path = []
+    next_cell = None
+    last_replan = 0.0
+    paused = False
+
+    running = True
+    t_prev = time.time()
+
+    while running:
+        # =============== INPUTS
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                running = False
+            elif e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE: running = False
+                if e.key == pygame.K_SPACE:  paused = not paused
+                if e.key == pygame.K_r:
+                    robot_rc[:] = ROBOT_START
+                    robot_px[:] = rc_to_center_px(*robot_rc)
+                    path.clear()
+                    next_cell = None
+            elif e.type == pygame.MOUSEBUTTONDOWN:
+                if e.button == 3:  # right-click sets goal
+                    mx, my = pygame.mouse.get_pos()
+                    gcol = mx // CELL
+                    grow = my // CELL
+                    goal_rc[:] = [grow, gcol]
+                    path.clear(); next_cell=None
+
+        # time delta
+        t_now = time.time()
+        dt = t_now - t_prev
+        t_prev = t_now
+
+        # =============== OBSTACLE GRID FROM CAMERA (dynamic)
+        grid = [row[:] for row in baseline_grid]  # copy baseline
+
+        if cap is not None:
+            ok, frame = cap.read()
+            if not ok:
+                # camera dropped; continue without it
+                cap.release()
+                cap = None
+            else:
+                frame = cv2.flip(frame, 1)
+                # Robust foreground segmentation
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (7,7), 0)
+                bw = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY_INV, 35, 8
+                )
+                bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, KERNEL, iterations=1)
+                bw = cv2.dilate(bw, KERNEL, iterations=1)
+
+                contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < MIN_CONTOUR_AREA:
+                        continue
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    # Map bbox to grid & mark as obstacles
+                    r0, c0, r1, c1 = bbox_to_grid(x, y, w, h, frame_w, frame_h)
+                    for r in range(r0, r1+1):
+                        for c in range(c0, c1+1):
+                            grid[r][c] = 1
+
+                # Visual debug window (press 'q' to close both)
+                cv2.imshow("cam", frame)
+                cv2.imshow("mask (detected foreground)", bw)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    running = False
+        else:
+            # ------ DEMO MODE: synthetic moving obstacle so judges see replanning
+            t = time.time()
+            # vertical bar oscillating left-right
+            c = int((math.sin(t*0.6)*0.5 + 0.5) * (GRID_W-6)) + 3
+            for r in range(6, GRID_H-6):
+                grid[r][c] = 1
+                grid[r][c+1] = 1
+
+        # Never block start/goal cells
+        grid[robot_rc[0]][robot_rc[1]] = 0
+        grid[goal_rc[0]][goal_rc[1]] = 0
+
+        # =============== REPLAN LOGIC
+        need_replan = False
+
+        # if next step blocked, or no path, or periodic refresh → replan
+        if not path or next_cell is None:
+            need_replan = True
+        elif grid[next_cell[0]][next_cell[1]] == 1:
+            need_replan = True
+        elif (t_now - last_replan) > REPLAN_EVERY_SEC:
+            need_replan = True
+
+        if need_replan and not paused:
+            new_path = astar(grid, tuple(robot_rc), tuple(goal_rc))
+            path = new_path[:]  # copy
+            next_cell = path[0] if path else None
+            last_replan = t_now
+
+            # Print path (grid cells) and world coordinates in meters
+            if path:
+                print("Planned path (grid cells):", path)
+                coords = [grid_cell_to_world((r,c)) for (r,c) in path]
+                print("Planned path (world coords meters):")
+                for idx, (xw, yw) in enumerate(coords):
+                    print(f"  step {idx+1}: x={xw:.3f} m, y={yw:.3f} m")
+            else:
+                print("No path found during replan.")
+
+        # =============== MOVE ROBOT SMOOTHLY
+        if not paused and next_cell is not None:
+            tx, ty = rc_to_center_px(*next_cell)  # target pixel
+            dx = tx - robot_px[0]
+            dy = ty - robot_px[1]
+            dist = math.hypot(dx, dy)
+
+            step = PIXELS_PER_SEC * dt
+            if dist > 1e-3 and step < dist:
+                robot_px[0] += (dx/dist) * step
+                robot_px[1] += (dy/dist) * step
+            else:
+                # snap to target, advance to the next waypoint
+                robot_px[0], robot_px[1] = tx, ty
+                robot_rc[:] = [next_cell[0], next_cell[1]]
+                if path:
+                    path.pop(0)
+                next_cell = path[0] if path else None
+
+        # =============== DRAW
+        screen.fill((10,10,10))
+
+        # grid + obstacles (obstacles now red)
+        for r in range(GRID_H):
+            for c in range(GRID_W):
+                x = c*CELL; y = r*CELL
+                if grid[r][c] == 1:
+                    pygame.draw.rect(screen, (200,0,0), (x, y, CELL, CELL))  # RED obstacle
+                pygame.draw.rect(screen, (0,220,0), (x, y, CELL, CELL), 1)
+
+        # path (yellow)
+        for (r, c) in path:
+            cx, cy = rc_to_center_px(r, c)
+            pygame.draw.circle(screen, (255,255,0), (cx, cy), CELL//6)
+
+        # goal (blue) & robot (red dot)
+        gx, gy = rc_to_center_px(*goal_rc)
+        pygame.draw.circle(screen, (0,120,255), (gx, gy), CELL//3)
+        pygame.draw.circle(screen, (255,60,60), (int(robot_px[0]), int(robot_px[1])), CELL//3)
+
+        # HUD
+        hud1 = f"Start: {tuple(robot_rc)}   Goal: {tuple(goal_rc)}   Replan Δt={REPLAN_EVERY_SEC:.2f}s"
+        hud2 = f"Path len: {len(path)}   FPS: {clock.get_fps():.1f}   {'PAUSED' if paused else ''}"
+        screen.blit(font.render(hud1, True, (230,230,230)), (8, 8))
+        screen.blit(font.render(hud2, True, (200,200,200)), (8, 28))
+        screen.blit(font.render("Right-click to set goal • SPACE pause • R reset • ESC quit • 'q' closes camera", True, (150,150,150)), (8, WIN_H-24))
+
+        pygame.display.flip()
+        clock.tick(60)
+
+    # tidy up
+    if cap is not None:
+        cap.release()
+    cv2.destroyAllWindows()
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
