@@ -1363,7 +1363,7 @@ def run_hardware_demo():
         
         # Test positions (adjust based on your workspace)
         test_operations = [
-            (Position3D(250, 150, 50), Position3D(350, 300, 60)),
+            (Position3D(400, 100, 100), Position3D(300, 250, 100)),
             (Position3D(-200, 200, 45), Position3D(-350, -250, 55)),
             (Position3D(150, -180, 40), Position3D(300, -300, 50))
         ]
@@ -1425,4 +1425,5 @@ if __name__ == "__main__":
     print("• Real-time path planning and collision avoidance")
     print("• Emergency stop and safety monitoring")
     print("• Performance tracking and diagnostics")
+
     print("="*60)
